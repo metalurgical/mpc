@@ -26,6 +26,7 @@ use borsh::BorshDeserialize;
 use bytes::Bytes;
 use ed25519_dalek::VerifyingKey;
 use futures::{SinkExt, StreamExt};
+use rand::Rng;
 use rustls::{ClientConfig, CommonState};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -38,7 +39,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_util::codec::{Decoder, Framed, LengthDelimitedCodec};
 use tokio_util::sync::CancellationToken;
 use tokio_util::time::FutureExt;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 /// Disables Nagle's algorithm, by setting TCP_NODELAY to true.
 /// This will send small packets immediately, reducing latency for node messages at
@@ -153,6 +154,8 @@ struct OutgoingConnection {
     /// This is cancelled when the connection is closed. Used to wait for the
     /// connection to close.
     closed: CancellationToken,
+    /// Cancelled to indicate to this connection that it must tear itself down and redial.
+    reconnect_requested: CancellationToken,
     peer_network_protocol_version: NetworkProtocolVersion,
 }
 
@@ -176,6 +179,7 @@ impl Packet {
         match &self {
             Packet::Ping => networking_metrics::PING_MESSAGE,
             Packet::IndexerHeight(_) => networking_metrics::INDEXER_HEIGHT_MESSAGE,
+            Packet::ReconnectRequest => networking_metrics::RECONNECT_REQUEST_MESSAGE,
             Packet::MpcMessage(MpcMessage { kind, .. }) => match kind {
                 MpcMessageKind::Start(_) => networking_metrics::MPC_START_MESSAGE,
                 MpcMessageKind::Computation(_) => networking_metrics::MPC_COMPUTATION_MESSAGE,
@@ -278,6 +282,8 @@ impl OutgoingConnection {
         let (sender, mut receiver) = mpsc::unbounded_channel::<Packet>();
         let closed = CancellationToken::new();
         let closed_clone = closed.clone();
+        let reconnect_requested = CancellationToken::new();
+        let reconnect_signal = reconnect_requested.clone();
         let sender_task = tracking::spawn_checked(
             &format!("TLS connection to {}", target_participant_id),
             async move {
@@ -295,18 +301,29 @@ impl OutgoingConnection {
                                 let serialized = borsh::to_vec(&data)?;
                                 let bytes = Bytes::from(serialized);
                                 let payload_size = bytes.len();
-
-                                // Add timeout to write operations to detect if writes are hanging
-                                // (e.g., due to half-open connection where peer stopped ACKing)
-                                match framed_tls_stream.send(bytes).timeout(WRITE_OPERATION_TIMEOUT).await {
-                                    Ok(Ok(_)) => {},
-                                    Ok(Err(e)) => return Err(e.into()),
-                                    Err(_) => {
-                                        // Write timed out - connection is likely stuck/half-open
-                                        return Err(anyhow::anyhow!(
-                                            "write operation timed out after {}s (connection may be half-open)",
-                                            WRITE_OPERATION_TIMEOUT.as_secs()
-                                        ));
+                                tokio::select! {
+                                    send_result = framed_tls_stream.send(bytes).timeout(WRITE_OPERATION_TIMEOUT) => {
+                                        match send_result {
+                                            Ok(Ok(())) => {},
+                                            Ok(Err(e)) => return Err(e.into()),
+                                            Err(_) => {
+                                                // Write timed out - connection is likely stuck/half-open
+                                                return Err(anyhow::anyhow!(
+                                                    "write operation timed out after {}s (connection may be half-open)",
+                                                    WRITE_OPERATION_TIMEOUT.as_secs()
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    _ = reconnect_signal.cancelled() => {
+                                networking_metrics::MPC_P2P_RECONNECT_RECEIVED
+                                    .with_label_values(&[peer_id_string.as_str()])
+                                    .inc();
+                                        debug!(
+                                            peer_id = %peer_id,
+                                            "tearing down outgoing connectio for reconnect request"
+                                        );
+                                        break;
                                     }
                                 }
 
@@ -343,6 +360,16 @@ impl OutgoingConnection {
                                 // is broken before we have data to send. That way we can
                                 // immediately quit the loop as soon as the connection is broken
                                 // (so we can reconnect).
+                                break;
+                            }
+                            _ = reconnect_signal.cancelled() => {
+                                networking_metrics::MPC_P2P_RECONNECT_RECEIVED
+                                    .with_label_values(&[peer_id_string.as_str()])
+                                    .inc();
+                                info!(
+                                    peer_id = %peer_id,
+                                    "tearing down outgoing connection  for reconnect request"
+                                );
                                 break;
                             }
                         }
@@ -392,6 +419,7 @@ impl OutgoingConnection {
             _sender_task: sender_task,
             _keepalive_task: keepalive_task,
             closed,
+            reconnect_requested,
             peer_network_protocol_version,
         })
     }
@@ -408,6 +436,20 @@ impl OutgoingConnection {
     fn send_indexer_height(&self, msg: IndexerHeightMessage) -> anyhow::Result<()> {
         self.sender.send(Packet::IndexerHeight(msg))?;
         Ok(())
+    }
+    fn send_reconnect_request(&self) -> anyhow::Result<()> {
+        if !self
+            .peer_network_protocol_version
+            .supports(NetworkProtocolVersion::Oct2026)
+        {
+            return Ok(());
+        }
+        self.sender.send(Packet::ReconnectRequest)?;
+        Ok(())
+    }
+
+    fn signal_reconnect(&self) {
+        self.reconnect_requested.cancel();
     }
 }
 
@@ -482,10 +524,14 @@ impl PersistentConnection {
                                 error = %format_args!("{e:#}"),
                                 "could not connect, retrying"
                             );
-
+                            // Jitter added to prevent thundering herd scenarios
+                            let jitter = std::time::Duration::from_millis(
+                                rand::thread_rng().gen_range(0..250),
+                            );
                             // Don't immediately retry, to avoid spamming the network with
                             // connection attempts.
-                            tokio::time::sleep(Self::CONNECTION_RETRY_DELAY).await;
+                            tokio::time::sleep(Self::CONNECTION_RETRY_DELAY.saturating_add(jitter))
+                                .await;
                             continue;
                         }
                     };
@@ -818,6 +864,13 @@ async fn incoming_connection_handler(
                         message,
                     }))?;
                 }
+                Packet::ReconnectRequest => {
+                    if let Ok(connectivity) = connectivities.get(peer_id)
+                        && let Some(outgoing) = connectivity.any_outgoing_connection()
+                    {
+                        outgoing.signal_reconnect();
+                    }
+                }
             }
 
             let metric_labels = [peer_id_string.as_str(), INCOMING_CONNECTION, message_label];
@@ -837,6 +890,22 @@ async fn incoming_connection_handler(
         }
     }
         .await;
+
+    if let Ok(connectivity) = connectivities.get(peer_id)
+        && let Some(outgoing) = connectivity.any_outgoing_connection()
+    {
+        if let Err(err) = outgoing.send_reconnect_request() {
+            tracing::warn!(
+                err = %err,
+                peer_id = %peer_id,
+                "failed to send reconnect request to peer"
+            );
+        } else {
+            networking_metrics::MPC_P2P_RECONNECT_SENT
+                .with_label_values(&[peer_id_string.as_str()])
+                .inc();
+        }
+    }
 
     // Peer closing without close_notify is normal in P2P networks (task aborts,
     // reconnections, process restarts). Treat it as a clean close, not an error.
@@ -1823,6 +1892,110 @@ mod tests {
             .unwrap()
             .unwrap();
             assert_eq!(bytes_read, 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn incoming_connection_handler__should_tear_down_outgoing_connection_on_reconnect_request()
+     {
+        start_root_task_with_periodic_dump(async move {
+            // Given
+            let id = ParticipantId::from_raw(0);
+            let peer_id = ParticipantId::from_raw(1);
+
+            let mut identities = ParticipantIdentities::default();
+            identities
+                .key_to_participant_id
+                .insert(make_signing_key().verifying_key(), peer_id);
+            let identities = Arc::new(identities);
+
+            let mut peer_identities = ParticipantIdentities::default();
+            peer_identities
+                .key_to_participant_id
+                .insert(make_signing_key().verifying_key(), id);
+            let peer_identities = Arc::new(peer_identities);
+
+            let connectivities = Arc::new(AllNodeConnectivities::<
+                OutgoingConnection,
+                IncomingConnection,
+            >::new(id, &[id, peer_id]));
+            let peer_connectivities = Arc::new(AllNodeConnectivities::<
+                OutgoingConnection,
+                IncomingConnection,
+            >::new(peer_id, &[id, peer_id]));
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap().to_string();
+            let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let peer_address = peer_listener.local_addr().unwrap().to_string();
+
+            let (message_sender, _message_receiver) = mpsc::unbounded_channel();
+            let incoming_task_connectivities = connectivities.clone();
+            let incoming_task_identities = identities.clone();
+            let _incoming_task = tracking::spawn("incoming connection handler", async move {
+                let (tcp_stream, _) = listener.accept().await.unwrap();
+                incoming_connection_handler(
+                    message_sender,
+                    incoming_task_connectivities,
+                    tcp_stream,
+                    make_tls_acceptor(),
+                    incoming_task_identities,
+                    id,
+                    Arc::new(IncomingConnectionLimits::new([peer_id])),
+                )
+                .await
+            });
+
+            let (peer_message_sender, _peer_message_receiver) = mpsc::unbounded_channel();
+            let peer_task_identities = peer_identities.clone();
+            let _peer_incoming_task =
+                tracking::spawn("peer incoming connection handler", async move {
+                    let (tcp_stream, _) = peer_listener.accept().await.unwrap();
+                    incoming_connection_handler(
+                        peer_message_sender,
+                        peer_connectivities,
+                        tcp_stream,
+                        make_tls_acceptor(),
+                        peer_task_identities,
+                        peer_id,
+                        Arc::new(IncomingConnectionLimits::new([id])),
+                    )
+                    .await
+                });
+
+            let outgoing_connection_peer = Arc::new(
+                OutgoingConnection::new(
+                    make_client_config(),
+                    &peer_address,
+                    peer_id,
+                    &identities,
+                    0,
+                )
+                .await
+                .unwrap(),
+            );
+            connectivities
+                .get(peer_id)
+                .unwrap()
+                .set_outgoing_connection(&outgoing_connection_peer);
+
+            let incomming_peer_connection =
+                OutgoingConnection::new(make_client_config(), &address, id, &peer_identities, 0)
+                    .await
+                    .unwrap();
+
+            // When
+            incomming_peer_connection.send_reconnect_request().unwrap();
+
+            // Then
+            timeout(
+                Duration::from_secs(5),
+                outgoing_connection_peer.wait_for_close(),
+            )
+            .await
+            .expect("outgoing connection should be closed");
         })
         .await;
     }

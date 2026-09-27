@@ -14,6 +14,7 @@ pub(crate) const MPC_START_MESSAGE: &str = "mpc_start";
 pub(crate) const MPC_COMPUTATION_MESSAGE: &str = "mpc_computation";
 pub(crate) const MPC_ABORT_MESSAGE: &str = "mpc_abort";
 pub(crate) const MPC_SUCCESS_MESSAGE: &str = "mpc_success";
+pub(crate) const RECONNECT_REQUEST_MESSAGE: &str = "reconnect_request";
 
 // TODO(#1852): remove this label. Don't reuse for new metrics.
 const LABEL_MY_PARTICIPANT_ID: &str = "my_participant_id";
@@ -74,6 +75,23 @@ pub(crate) static INCOMING_CONNECTIONS_REJECTED: LazyLock<IntCounterVec> = LazyL
     register_int_counter_vec!(
         "mpc_network_incoming_connections_rejected",
         "Connection dropped due to peer exceeding its' connection limit",
+        &[LABEL_PEER_PARTICIPANT_ID],
+    )
+    .unwrap()
+});
+pub(crate) static MPC_P2P_RECONNECT_SENT: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "mpc_p2p_reconnect_sent_total",
+        "Total number of reconnect requests sent",
+        &[LABEL_PEER_PARTICIPANT_ID],
+    )
+    .unwrap()
+});
+
+pub(crate) static MPC_P2P_RECONNECT_RECEIVED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "mpc_p2p_reconnect_received_total",
+        "Total number of reconnect requests received",
         &[LABEL_PEER_PARTICIPANT_ID],
     )
     .unwrap()

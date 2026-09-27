@@ -18,6 +18,7 @@ pub enum Packet {
     Ping = 0,
     MpcMessage(MpcMessage) = 1,
     IndexerHeight(IndexerHeightMessage) = 2,
+    ReconnectRequest = 3,
 }
 
 #[derive(Clone, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
@@ -233,6 +234,7 @@ mod tests {
                     kind: MpcMessageKind::Success,
                 }),
                 Packet::IndexerHeight(IndexerHeightMessage { height: 4 }),
+                Packet::ReconnectRequest,
             ]),
             rows(&[
                 MpcMessageKind::Start(MpcStartMessage {
