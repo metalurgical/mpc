@@ -51,6 +51,7 @@ const TCP_CONNECTION_RETRY_DELAY: std::time::Duration = std::time::Duration::fro
 const TCP_CONNECTION_RETRIES: u32 = 3;
 
 const PING_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const SUPERCEDED_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 type FrameHeader = u32;
 const FRAME_HEADER_SIZE_BYTES: usize = size_of::<FrameHeader>();
@@ -321,7 +322,7 @@ impl OutgoingConnection {
                                     .inc();
                                         debug!(
                                             peer_id = %peer_id,
-                                            "tearing down outgoing connectio for reconnect request"
+                                            "tearing down outgoing connection for reconnect request"
                                         );
                                         break;
                                     }
@@ -368,7 +369,7 @@ impl OutgoingConnection {
                                     .inc();
                                 info!(
                                     peer_id = %peer_id,
-                                    "tearing down outgoing connection  for reconnect request"
+                                    "tearing down outgoing connection for reconnect request"
                                 );
                                 break;
                             }
@@ -818,19 +819,51 @@ async fn incoming_connection_handler(
 
     let peer_id_string = peer_id.to_string();
 
+    let read_deadline = tokio::time::sleep(MESSAGE_READ_TIMEOUT_DURATION);
+    tokio::pin!(read_deadline);
+
+    let mut superceded_check = tokio::time::interval(SUPERCEDED_CHECK_INTERVAL);
+    superceded_check.tick().await; // skip immediate tick.
+
+    let mut connection_superceded = false;
+
     let result: anyhow::Result<()> = async {
         loop {
-            let payload_bytes = match framed_tls_stream_reader
-                .next()
-                .timeout(MESSAGE_READ_TIMEOUT_DURATION)
-                .await?
-            {
-                Some(result) => result?,
-                None => {
-                    // Stream ended cleanly (peer closed connection).
-                    return Ok(());
+            let payload_bytes = loop {
+                tokio::select! {
+                    biased;
+                    next = framed_tls_stream_reader.next() => {
+                        match next {
+                            Some(bytes) => break bytes?,
+                            None => {
+                                // Stream ended cleanly (peer closed connection).
+                                return Ok(());
+                            }
+                        }
+                    }
+                    () = &mut read_deadline => {
+                        anyhow::bail!(
+                            "no message received from peer within {}s",
+                            MESSAGE_READ_TIMEOUT_DURATION.as_secs()
+                        );
+                    }
+                    _ = superceded_check.tick() => {
+                        let current_id = connectivities.get(peer_id)?.sender_connection_id();
+                        let is_superceded = current_id.is_some_and(|id| id > sender_connection_id);
+                        if is_superceded {
+                            tracing::info!(
+                                peer_id = %peer_id,
+                                "incoming connection superceded with newer connection from same peer"
+                            );
+                            connection_superceded = true;
+                            return Ok(());
+                        }
+                    }
                 }
             };
+            read_deadline
+                .as_mut()
+                .reset(tokio::time::Instant::now() + MESSAGE_READ_TIMEOUT_DURATION);
 
             let total_message_size_bytes: u64 = match FRAME_HEADER_SIZE_BYTES.checked_add(payload_bytes.len()) {
                 Some(size) => size.try_into().unwrap_or_else(|_| {
@@ -891,7 +924,8 @@ async fn incoming_connection_handler(
     }
         .await;
 
-    if let Ok(connectivity) = connectivities.get(peer_id)
+    if !connection_superceded
+        && let Ok(connectivity) = connectivities.get(peer_id)
         && let Some(outgoing) = connectivity.any_outgoing_connection()
     {
         if let Err(err) = outgoing.send_reconnect_request() {
@@ -1201,10 +1235,17 @@ pub mod testing {
 mod tests {
     use super::{
         IncomingConnection, IncomingConnectionLimits, MAX_CONCURRENT_CONNECTIONS_PER_PARTICIPANT,
-        OutgoingConnection, ParticipantIdentities, PersistentConnection,
-        incoming_connection_handler,
+        OutgoingConnection, ParticipantIdentities, PersistentConnection, TLS_ACCEPT_TIMEOUT,
+        configure_framed_stream, configure_tcp_stream, incoming_connection_handler,
+        verify_peer_identity,
     };
     use crate::config::MpcConfig;
+    use crate::network::conn::OptionSenderConnectionId;
+    use crate::network::handshake::{
+        DialerData, ListenerData, MIN_EXPECTED_CONNECTION_ID, p2p_handshake_dialer,
+        p2p_handshake_listener,
+    };
+    use crate::network::wire_format::Packet;
     use crate::network::{
         conn::{AllNodeConnectivities, ConnectionVersion},
         wire_format::{EcdsaTaskId, MpcTaskId},
@@ -1216,7 +1257,9 @@ mod tests {
     };
     use crate::protocol_version::CURRENT_PROTOCOL_VERSION;
     use crate::tracking::{self, testing::start_root_task_with_periodic_dump};
+    use borsh::BorshDeserialize;
     use ed25519_dalek::SigningKey;
+    use futures::StreamExt;
     use mpc_primitives::{AttemptId, EpochId, KeyEventId, domain::DomainId};
     use mpc_tls::tls::configure_tls;
     use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -1996,6 +2039,215 @@ mod tests {
             )
             .await
             .expect("outgoing connection should be closed");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn incoming_connection_handler__should_exit_promptly_once_superceded_by_a_newer_connection()
+     {
+        start_root_task_with_periodic_dump(async move {
+            // Given
+            let my_id = ParticipantId::from_raw(0);
+            let peer_id = ParticipantId::from_raw(1);
+
+            let mut participant_identities = ParticipantIdentities::default();
+            participant_identities
+                .key_to_participant_id
+                .insert(make_signing_key().verifying_key(), peer_id);
+            let participant_identities = Arc::new(participant_identities);
+
+            let connectivities = Arc::new(AllNodeConnectivities::<
+                OutgoingConnection,
+                IncomingConnection,
+            >::new(my_id, &[my_id, peer_id]));
+
+            let (server_tcp, client_tcp) = must_accept_silent_connection().await;
+            let (message_sender, _message_receiver) = mpsc::unbounded_channel();
+
+            let handler_task = tracking::spawn(
+                "incoming connection handler",
+                incoming_connection_handler(
+                    message_sender,
+                    connectivities.clone(),
+                    server_tcp,
+                    make_tls_acceptor(),
+                    participant_identities,
+                    my_id,
+                    Arc::new(IncomingConnectionLimits::new([peer_id])),
+                ),
+            );
+
+            let mut client = tokio_rustls::TlsConnector::from(make_client_config())
+                .connect("dummy".try_into().unwrap(), client_tcp)
+                .await
+                .unwrap();
+            p2p_handshake_dialer(
+                DialerData {
+                    sender_connection_id: 0,
+                },
+                &mut client,
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(
+                connectivities.get(peer_id).unwrap().sender_connection_id(),
+                Some(0)
+            );
+
+            // When
+            let newer_connection = Arc::new(IncomingConnection {
+                sender_connection_id: 1,
+                peer_network_protocol_version: CURRENT_PROTOCOL_VERSION,
+            });
+            connectivities
+                .get(peer_id)
+                .unwrap()
+                .set_incoming_connection(&newer_connection)
+                .unwrap();
+
+            // Then
+            timeout(Duration::from_secs(15), handler_task)
+                .await
+                .expect("handler should exit before read timeout")
+                .expect("task should not panic")
+                .expect("should succeed");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[test_log::test]
+    async fn incoming_connection_handler__should_not_send_reconnect_request_when_superceded() {
+        start_root_task_with_periodic_dump(async move {
+            // Given
+            let my_id = ParticipantId::from_raw(0);
+            let peer_id = ParticipantId::from_raw(1);
+
+            let mut my_identities = ParticipantIdentities::default();
+            my_identities
+                .key_to_participant_id
+                .insert(make_signing_key().verifying_key(), peer_id);
+            let my_identities = Arc::new(my_identities);
+
+            let connectivities = Arc::new(AllNodeConnectivities::<
+                OutgoingConnection,
+                IncomingConnection,
+            >::new(my_id, &[my_id, peer_id]));
+
+            let (server_tcp, client_tcp) = must_accept_silent_connection().await;
+            let (message_sender, _message_receiver) = mpsc::unbounded_channel();
+            let handler_task = tracking::spawn(
+                "incoming connection handler",
+                incoming_connection_handler(
+                    message_sender,
+                    connectivities.clone(),
+                    server_tcp,
+                    make_tls_acceptor(),
+                    my_identities.clone(),
+                    my_id,
+                    Arc::new(IncomingConnectionLimits::new([peer_id])),
+                ),
+            );
+            let mut client = tokio_rustls::TlsConnector::from(make_client_config())
+                .connect("dummy".try_into().unwrap(), client_tcp)
+                .await
+                .unwrap();
+            p2p_handshake_dialer(
+                DialerData {
+                    sender_connection_id: 0,
+                },
+                &mut client,
+            )
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(
+                connectivities.get(peer_id).unwrap().sender_connection_id(),
+                Some(0)
+            );
+
+            let peer_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let peer_address = peer_listener.local_addr().unwrap().to_string();
+
+            let mut peer_identities = ParticipantIdentities::default();
+            peer_identities
+                .key_to_participant_id
+                .insert(make_signing_key().verifying_key(), my_id);
+            let peer_identities = Arc::new(peer_identities);
+
+            let received_reconnect_request = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let received_reconnect_request_writer = received_reconnect_request.clone();
+            let _peer_reader_task = tracking::spawn("peer raw packet reader", async move {
+                let (tcp_stream, _) = peer_listener.accept().await.unwrap();
+                let tcp_stream = configure_tcp_stream(tcp_stream).unwrap();
+                let mut tls_stream =
+                    timeout(TLS_ACCEPT_TIMEOUT, make_tls_acceptor().accept(tcp_stream))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                verify_peer_identity(tls_stream.get_ref().1, &peer_identities).unwrap();
+                p2p_handshake_listener(
+                    ListenerData {
+                        min_expected_connection_id: MIN_EXPECTED_CONNECTION_ID,
+                    },
+                    &mut tls_stream,
+                )
+                .await
+                .unwrap();
+                let mut framed = configure_framed_stream(tls_stream);
+                loop {
+                    let Some(Ok(bytes)) = framed.next().await else {
+                        return;
+                    };
+                    if let Ok(Packet::ReconnectRequest) = Packet::try_from_slice(&bytes) {
+                        received_reconnect_request_writer
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            });
+
+            let outgoing_peer_conection = Arc::new(
+                OutgoingConnection::new(
+                    make_client_config(),
+                    &peer_address,
+                    peer_id,
+                    &my_identities,
+                    0,
+                )
+                .await
+                .unwrap(),
+            );
+            connectivities
+                .get(peer_id)
+                .unwrap()
+                .set_outgoing_connection(&outgoing_peer_conection);
+
+            // When
+            let newer_connection = Arc::new(IncomingConnection {
+                sender_connection_id: 1,
+                peer_network_protocol_version: CURRENT_PROTOCOL_VERSION,
+            });
+            connectivities
+                .get(peer_id)
+                .unwrap()
+                .set_incoming_connection(&newer_connection)
+                .unwrap();
+
+            timeout(Duration::from_secs(15), handler_task)
+                .await
+                .expect("handler should exit before the read timeout")
+                .expect("task should not panic")
+                .expect("should succeed");
+
+            // Then
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert!(
+                !received_reconnect_request.load(std::sync::atomic::Ordering::SeqCst),
+                "peer should not have been sent a reconnect request, connection superceded"
+            );
         })
         .await;
     }
