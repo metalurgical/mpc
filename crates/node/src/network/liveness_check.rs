@@ -47,7 +47,7 @@ impl EchoTracker {
     }
 
     pub fn prepare_next_nonce(&mut self) -> Serial8 {
-        self.next_nonce.next()
+        self.next_nonce.increment()
     }
 
     pub fn is_stale(&self, nonce: Serial8) -> bool {

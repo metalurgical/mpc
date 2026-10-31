@@ -1119,8 +1119,14 @@ async fn incoming_connection_handler(
     // Send TLS close_notify before dropping the connection so
     // the peer does not see an unexpected EOF.
     let mut tls_stream = framed_tls_stream_reader.into_inner();
-    if let Err(err) = tls_stream.shutdown().await {
-        tracing::debug!(err = %err, "TLS shutdown failed on incoming connection");
+    match tls_stream.shutdown().timeout(TLS_SHUTDOWN_TIMEOUT).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::debug!(err = %err, "TLS shutdown failed on incoming connection");
+        }
+        Err(_) => {
+            tracing::debug!("TLS shutdown timed out on incoming connection");
+        }
     }
 
     result

@@ -10,7 +10,7 @@ impl Serial8 {
     }
 
     #[inline]
-    pub fn next(&mut self) -> Self {
+    pub fn increment(&mut self) -> Self {
         let current = *self;
         self.0 = self.0.wrapping_add(1);
         current
