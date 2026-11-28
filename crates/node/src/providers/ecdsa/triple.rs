@@ -114,7 +114,19 @@ impl EcdsaSignatureProvider {
         );
 
         loop {
+            // Do maintenance before deciding to generate
+            recently_alive.observe(&client.all_alive_participant_ids());
             let available_triples_count = triple_store.num_owned();
+            let discard_budget =
+                32 * usize::from(available_triples_count >= config.desired_triples_to_buffer);
+            triple_store
+                .maybe_discard_owned(
+                    discard_budget,
+                    recently_alive.retained(),
+                    config.desired_triples_to_buffer,
+                )
+                .await;
+
             let my_triples_count = triple_store.num_owned_with_parked();
             let should_generate = my_triples_count + in_flight_generations.num_in_flight()
                 < config.desired_triples_to_buffer;
@@ -201,17 +213,6 @@ impl EcdsaSignatureProvider {
                 continue;
             }
 
-            // If the store is full, try to discard some triples which cannot be used right now
-            recently_alive.observe(&client.all_alive_participant_ids());
-            let discard_budget =
-                32 * usize::from(available_triples_count >= config.desired_triples_to_buffer);
-            triple_store
-                .maybe_discard_owned(
-                    discard_budget,
-                    recently_alive.retained(),
-                    config.desired_triples_to_buffer,
-                )
-                .await;
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
