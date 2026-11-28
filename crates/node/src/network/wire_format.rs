@@ -33,7 +33,7 @@ impl Packet {
                 NetworkProtocolVersion::Dec2025
             }
             Packet::ConnectedPeersInfo(_) => NetworkProtocolVersion::Oct2026,
-            Packet::Echo(_) | Packet::EchoAck(_) => NetworkProtocolVersion::Nov2026,
+            Packet::Echo(_) | Packet::EchoAck(_) => NetworkProtocolVersion::Dec2026,
         }
     }
 }
@@ -344,22 +344,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn packet__should_require_nov2026_for_echos() {
-        assert_eq!(
-            Packet::Echo(Heartbeat {
-                nonce: Default::default()
-            })
-            .min_protocol_version(),
-            NetworkProtocolVersion::Nov2026
-        );
-        assert_eq!(
-            Packet::EchoAck(Heartbeat {
-                nonce: Default::default()
-            })
-            .min_protocol_version(),
-            NetworkProtocolVersion::Nov2026
-        );
+    #[rstest]
+    #[case::echo(Packet::Echo(Heartbeat { nonce: Default::default() }))]
+    #[case::echo_ack(Packet::EchoAck(Heartbeat { nonce: Default::default() }))]
+    fn packet__should_require_Dec2026_for_echos(#[case] packet: Packet) {
+        // When
+        let version = packet.min_protocol_version();
+
+        // Then
+        assert_eq!(version, NetworkProtocolVersion::Dec2026);
     }
 
     #[test]

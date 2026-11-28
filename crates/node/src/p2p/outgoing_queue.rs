@@ -4,7 +4,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 /// Enqueues packets for one peer; the connection's sender task drains them through
 /// [`OutgoingQueueReceiver`] and writes them to the TLS stream.
 ///
-/// Control packets (pings, indexer heights, connected-peers info. liveness) skip ahead of queued MPC
+/// Control packets (pings, indexer heights, connected-peers info, echoes) skip ahead of queued MPC
 /// messages. Peers decide whether we are alive from our indexer height, so a backlog of
 /// computation traffic must not delay it. Packets in the same lane keep their order.
 #[derive(Clone)]
@@ -66,7 +66,10 @@ impl OutgoingQueueReceiver {
 mod tests {
     use super::OutgoingQueue;
     use crate::network::wire_format::{MpcMessageKind, Packet};
-    use crate::primitives::{ChannelId, IndexerHeightMessage, MpcMessage, ParticipantId, UniqueId};
+    use crate::primitives::{
+        ChannelId, Heartbeat, IndexerHeightMessage, MpcMessage, ParticipantId, UniqueId,
+    };
+    use rstest::rstest;
 
     fn mpc_packet(counter: u32) -> Packet {
         Packet::MpcMessage(MpcMessage {
@@ -86,14 +89,20 @@ mod tests {
             .collect()
     }
 
+    #[rstest]
+    #[case::indexer_height(height_packet(42))]
+    #[case::echo(Packet::Echo(Heartbeat { nonce: Default::default() }))]
+    #[case::echo_ack(Packet::EchoAck(Heartbeat { nonce: Default::default() }))]
     #[tokio::test]
-    async fn outgoing_queue__should_deliver_control_packets_before_queued_mpc_messages() {
+    async fn outgoing_queue__should_deliver_control_packets_before_queued_mpc_messages(
+        #[case] control_packet: Packet,
+    ) {
         // Given
         let (queue, mut receiver) = OutgoingQueue::new();
         for counter in 0..3 {
             queue.send(mpc_packet(counter)).unwrap();
         }
-        queue.send(height_packet(42)).unwrap();
+        queue.send(control_packet.clone()).unwrap();
 
         // When
         let mut received = Vec::new();
@@ -102,12 +111,7 @@ mod tests {
         }
 
         // Then
-        let expected = [
-            height_packet(42),
-            mpc_packet(0),
-            mpc_packet(1),
-            mpc_packet(2),
-        ];
+        let expected = [control_packet, mpc_packet(0), mpc_packet(1), mpc_packet(2)];
         assert_eq!(encoded(&received), encoded(&expected));
     }
 

@@ -177,8 +177,8 @@ struct OutgoingConnection {
     /// not expect a Pong, it simply keeps the connection alive (so we can
     /// quickly detect if the connection is broken).
     _keepalive_task: AutoAbortTask<()>,
-    /// Task that periodically sends an `Echo` to the other side and expects the peer to
-    /// answer with an `EchoAck`.
+    /// Task that periodically sends a [`Packet::Echo`] to the other side and expects the peer to
+    /// answer with a [`Packet::EchoAck`].
     _echo_task: Option<AutoAbortTask<()>>,
     echo_ack_sender: Option<mpsc::Sender<Rfc1982SerialU8>>,
     /// This is cancelled when the connection is closed. Used to wait for the
@@ -1400,9 +1400,10 @@ pub mod testing {
 #[expect(non_snake_case)]
 mod tests {
     use super::{
-        IncomingConnectionInfo, IncomingConnectionLimits, MAX_CONCURRENT_CONNECTIONS_PER_PARTICIPANT,
-        OUTGOING_MAX_MISSED_CHECKS, OutgoingConnection, OutgoingWatchdog, ParticipantIdentities,
-        PersistentConnection, incoming_connection_handler, outgoing_queue::OutgoingQueue,
+        IncomingConnectionInfo, IncomingConnectionLimits,
+        MAX_CONCURRENT_CONNECTIONS_PER_PARTICIPANT, OUTGOING_MAX_MISSED_CHECKS, OutgoingConnection,
+        OutgoingWatchdog, ParticipantIdentities, PersistentConnection, incoming_connection_handler,
+        outgoing_queue::OutgoingQueue,
     };
     use crate::{
         config::MpcConfig,
@@ -1724,13 +1725,14 @@ mod tests {
     fn test_outgoing_connection(
         queue: OutgoingQueue,
         peer_version: NetworkProtocolVersion,
+        echo_ack_sender: Option<mpsc::Sender<crate::network::rfc1982::Rfc1982SerialU8>>,
     ) -> Arc<OutgoingConnection> {
         Arc::new(OutgoingConnection {
             queue,
             _sender_task: tokio::spawn(futures::future::pending()).into(),
             _keepalive_task: tokio::spawn(futures::future::pending()).into(),
             _echo_task: None,
-            echo_ack_sender: None,
+            echo_ack_sender,
             closed: CancellationToken::new(),
             peer_network_protocol_version: peer_version,
         })
@@ -1747,7 +1749,7 @@ mod tests {
     ) {
         // Given
         let (queue, mut packets) = OutgoingQueue::new();
-        let connection = test_outgoing_connection(queue, peer_version);
+        let connection = test_outgoing_connection(queue, peer_version, None);
         let connectivity =
             Arc::new(NodeConnectivity::<OutgoingConnection, IncomingConnectionInfo>::new());
         connectivity.set_outgoing_connection(&connection);
@@ -2258,24 +2260,32 @@ mod tests {
             }
         }
 
-        #[test]
-        fn peer_supports_echo__should_evaluate_protocol_version() {
-            assert!(!peer_supports_echo(NetworkProtocolVersion::Dec2025));
-            assert!(peer_supports_echo(NetworkProtocolVersion::Nov2026));
+        #[rstest]
+        #[case(NetworkProtocolVersion::Oct2026, false)]
+        #[case(NetworkProtocolVersion::Dec2026, true)]
+        fn peer_supports_echo__should_evaluate_protocol_version(
+            #[case] version: NetworkProtocolVersion,
+            #[case] expected: bool,
+        ) {
+            // When
+            let supported = peer_supports_echo(version);
+
+            // Then
+            assert_eq!(supported, expected);
         }
 
         #[rstest]
         #[case(NetworkProtocolVersion::Oct2026, false)]
-        #[case(NetworkProtocolVersion::Nov2026, true)]
+        #[case(NetworkProtocolVersion::Dec2026, true)]
         #[tokio::test(start_paused = true)]
-        async fn outgoing_connection__should_send_echos_only_to_nov2026_peers(
+        async fn outgoing_connection__should_send_echos_only_to_Dec2026_peers(
             #[case] peer_version: NetworkProtocolVersion,
             #[case] expected_sent: bool,
         ) {
             // Given
             resume();
             let (queue, mut packets) = OutgoingQueue::new();
-            let connection = test_outgoing_connection(queue, peer_version);
+            let connection = test_outgoing_connection(queue, peer_version, None);
 
             // When
             connection.send_echo_ack(Heartbeat {
@@ -2313,51 +2323,33 @@ mod tests {
             assert!(!liveness_failed.is_cancelled());
         }
 
+        #[rstest]
+        #[case::no_ack(&[])]
+        #[case::rogue_nonce(&[5])]
         #[tokio::test(start_paused = true)]
-        async fn run_echo_liveness__should_cancel_token_when_peer_times_out() {
-            // Given
-            let (packet_tx, mut packet_rx, _ack_tx, ack_rx, liveness_failed) = setup_liveness();
-            let echo_tracker = EchoTracker::default();
-
-            // When
-            tokio::spawn(run_echo_liveness(
-                packet_tx,
-                echo_tracker,
-                Arc::default(),
-                ack_rx,
-                liveness_failed.clone(),
-                echo_rtt(),
-            ));
-            advance(ECHO_INTERVAL).await;
-            assert!(packet_rx.recv().await.is_some());
-            advance(ECHO_TIMEOUT.saturating_add(Duration::from_millis(100))).await;
-
-            // Then
-            assert_cancelled(&liveness_failed).await;
-        }
-
-        #[tokio::test(start_paused = true)]
-        async fn run_echo_liveness__should_ignore_rogue_nonces() {
+        async fn run_echo_liveness__should_cancel_token_without_valid_ack(
+            #[case] ack_offsets: &[u8],
+        ) {
             // Given
             let (packet_tx, mut packet_rx, ack_tx, ack_rx, liveness_failed) = setup_liveness();
-            let echo_tracker = EchoTracker::default();
             tokio::spawn(run_echo_liveness(
                 packet_tx,
-                echo_tracker,
+                EchoTracker::default(),
                 Arc::default(),
                 ack_rx,
                 liveness_failed.clone(),
                 echo_rtt(),
             ));
             advance(ECHO_INTERVAL).await;
-            let Some(Packet::Echo(Heartbeat { nonce: valid_nonce })) = packet_rx.recv().await
-            else {
+            let Some(Packet::Echo(Heartbeat { nonce })) = packet_rx.recv().await else {
                 panic!("Expected Packet::Echo");
             };
 
             // When
-            let rogue_nonce = Rfc1982SerialU8(valid_nonce.0.wrapping_add(5));
-            ack_tx.send(rogue_nonce).await.unwrap();
+            for offset in ack_offsets {
+                let ack = Rfc1982SerialU8(nonce.0.wrapping_add(*offset));
+                ack_tx.send(ack).await.unwrap();
+            }
             advance(ECHO_TIMEOUT.saturating_add(Duration::from_millis(100))).await;
 
             // Then
@@ -2478,15 +2470,8 @@ mod tests {
             resume();
             let (queue, _receiver) = OutgoingQueue::new();
             let (ack_tx, mut ack_rx) = mpsc::channel(1);
-            let connection = OutgoingConnection {
-                queue,
-                _sender_task: tokio::spawn(async {}).into(),
-                _keepalive_task: tokio::spawn(async {}).into(),
-                _echo_task: None,
-                echo_ack_sender: Some(ack_tx),
-                closed: CancellationToken::new(),
-                peer_network_protocol_version: NetworkProtocolVersion::Nov2026,
-            };
+            let connection =
+                test_outgoing_connection(queue, NetworkProtocolVersion::Dec2026, Some(ack_tx));
 
             // When
             (1..=3)
@@ -2567,7 +2552,8 @@ mod tests {
                 let mut loopback = LoopbackPeer::connect().await;
                 pause();
                 let (queue, mut rx) = OutgoingQueue::new();
-                let outgoing = test_outgoing_connection(queue, NetworkProtocolVersion::Nov2026);
+                let outgoing =
+                    test_outgoing_connection(queue, NetworkProtocolVersion::Dec2026, None);
                 match open_state {
                     None => {}
                     Some(false) => {
@@ -2608,7 +2594,8 @@ mod tests {
                 resume();
                 let mut loopback = LoopbackPeer::connect().await;
                 let (queue, mut rx) = OutgoingQueue::new();
-                let outgoing = test_outgoing_connection(queue, NetworkProtocolVersion::Nov2026);
+                let outgoing =
+                    test_outgoing_connection(queue, NetworkProtocolVersion::Dec2026, None);
                 loopback.connectivity.set_outgoing_connection(&outgoing);
 
                 // When
@@ -2636,15 +2623,8 @@ mod tests {
                 let mut loopback = LoopbackPeer::connect().await;
                 let (queue, _receiver) = OutgoingQueue::new();
                 let (ack_tx, mut ack_rx) = mpsc::channel(1);
-                let outgoing = Arc::new(OutgoingConnection {
-                    queue,
-                    _sender_task: tokio::spawn(async {}).into(),
-                    _keepalive_task: tokio::spawn(async {}).into(),
-                    _echo_task: None,
-                    echo_ack_sender: Some(ack_tx),
-                    closed: CancellationToken::new(),
-                    peer_network_protocol_version: NetworkProtocolVersion::Nov2026,
-                });
+                let outgoing =
+                    test_outgoing_connection(queue, NetworkProtocolVersion::Dec2026, Some(ack_tx));
                 loopback.connectivity.set_outgoing_connection(&outgoing);
 
                 // When

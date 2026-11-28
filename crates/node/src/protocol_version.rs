@@ -2,7 +2,7 @@ use derive_more::Display;
 use num_enum::{FromPrimitive, IntoPrimitive};
 
 /// the current protocol version
-pub const CURRENT_PROTOCOL_VERSION: NetworkProtocolVersion = NetworkProtocolVersion::Nov2026;
+pub const CURRENT_PROTOCOL_VERSION: NetworkProtocolVersion = NetworkProtocolVersion::Dec2026;
 
 /// This must be extended every time we introduce an incompatible protocol
 /// change.
@@ -23,7 +23,7 @@ pub enum NetworkProtocolVersion {
     Oct2026 = 10,
     /// Adds [`Packet::Echo`](crate::network::wire_format::Packet::Echo)
     /// and [`Packet::EchoAck`](crate::network::wire_format::Packet::EchoAck)
-    Nov2026 = 11,
+    Dec2026 = 11,
     #[num_enum(catch_all)]
     Unknown(u32),
 }
